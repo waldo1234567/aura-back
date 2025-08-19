@@ -58,7 +58,7 @@ public class VlogController {
         Map<String, Double> hrvFreq = analyticsService.computeFrequencyHrv(heartRates);
         analyticsService.diagnoseAndComputeHrMetrics(heartRates);
         Map<String,Object> riskSummary = analyticsService.computeRiskSummary(faceMetrics, hrvMetrics, voiceMetrics, data.getTranscript());
-
+        System.out.print("tes");
         List<String> dangerKeywords = List.of("suicide","kill myself","i can't go on","don't want to live","hopeless","end my life","suicidal");
 
 
