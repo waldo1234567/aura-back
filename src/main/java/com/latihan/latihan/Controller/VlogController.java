@@ -1,7 +1,10 @@
 package com.latihan.latihan.Controller;
 
-import com.latihan.latihan.Config.WebClientConfig;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.latihan.latihan.DTO.*;
+import com.latihan.latihan.Entity.SessionEntity;
+import com.latihan.latihan.Repository.SessionRepository;
 import com.latihan.latihan.Service.AnalyticsService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
@@ -13,10 +16,10 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.reactive.function.client.WebClient;
 
-import java.util.Arrays;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
+import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.util.*;
 
 @RestController
 @RequiredArgsConstructor
@@ -26,9 +29,11 @@ public class VlogController {
     private final AnalyticsService analyticsService;
     @Autowired
     private final WebClient webClient;
+    @Autowired
+    private final SessionRepository sessionRepository;
 
     @PostMapping("/vlogs")
-    public ResponseEntity<?> handleVlog(@Valid @RequestBody SessionData data){
+    public ResponseEntity<?> handleVlog(@Valid @RequestBody SessionData data) throws JsonProcessingException {
         List<ExpressionPoint> expressions = data.getTimeline().stream()
                 .map(TimelineEntry::getExpression)
                 .filter(Objects::nonNull)
@@ -51,6 +56,20 @@ public class VlogController {
         Map<String, Double> exprAdv = analyticsService.summarizeFaceAdv(expressions);
         Map<String, Object> voiceAdv = analyticsService.summarizeVoiceAdv(voicePoints);
         Map<String, Double> hrvFreq = analyticsService.computeFrequencyHrv(heartRates);
+        analyticsService.diagnoseAndComputeHrMetrics(heartRates);
+        Map<String,Object> riskSummary = analyticsService.computeRiskSummary(faceMetrics, hrvMetrics, voiceMetrics, data.getTranscript());
+
+        List<String> dangerKeywords = List.of("suicide","kill myself","i can't go on","don't want to live","hopeless","end my life","suicidal");
+
+
+        String detectedLang = analyticsService.detectLanguage(data.getTranscript());
+        String translated = analyticsService.translateToEnglish(data.getTranscript());
+
+        ObjectMapper mapper = new ObjectMapper();
+        String faceMetricsJson = mapper.writeValueAsString(faceMetrics);
+        String hrvMetricsJson = mapper.writeValueAsString(hrvMetrics);
+        String voiceMetricsJson = mapper.writeValueAsString(voiceMetrics);
+        String riskSummaryJson = mapper.writeValueAsString(riskSummary);
 
         String prompt = buildInterpretationPrompt(
                 data.getTranscript(),
@@ -98,30 +117,66 @@ public class VlogController {
         if (candidates != null && !candidates.isEmpty()) {
             Map<String, Object> firstCandidate = candidates.get(0);
 
-            // The output is inside a "content" object, which contains a "parts" array
             Map<String, Object> responseContent = (Map<String, Object>) firstCandidate.get("content");
 
-            // Check if responseContent is not null before accessing "parts"
+
             String aiReply = "";
             if (responseContent != null) {
                 List<Map<String, Object>> parts = (List<Map<String, Object>>) responseContent.get("parts");
 
-                // Check if parts is not null or empty
                 if (parts != null && !parts.isEmpty()) {
-                    // The actual text is under the key "text"
                     aiReply = (String) parts.get(0).get("text");
                 }
             }
-
             System.out.println(aiReply);
-            return ResponseEntity.ok(Map.of(
-                    "reply", aiReply,
-                    "faceMetrics", faceMetrics,
-                    "hrvMetrics", hrvMetrics,
-                    "voiceMetrics", voiceMetrics
-            ));
+
+            Map<String,Object> parsed = analyticsService.parseAiReplyForStructuredData(aiReply, mapper);
+
+            @SuppressWarnings("unchecked")
+            List<Map<String,Object>> parsedFlagged = (List<Map<String,Object>>) parsed.get("flaggedExcerpts");
+            @SuppressWarnings("unchecked")
+            List<Map<String,Object>> parsedActions = (List<Map<String,Object>>) parsed.get("actionableHighlights");
+
+            System.out.println("Parsed flagged excerpts from AI: " + parsedFlagged);
+            System.out.println("Parsed action items from AI: " + parsedActions);
+
+            String flaggedExcerptsJsonToSave = mapper.writeValueAsString(parsedFlagged);
+            String actionItemsJsonToSave   = mapper.writeValueAsString(parsedActions);
+
+            SessionEntity session = SessionEntity.builder()
+                    .transcript(data.getTranscript())
+                    .usePolished(data.getUsePolished())
+                    .timeline(mapper.writeValueAsString(data.getTimeline()))
+                    .faceMetrics(faceMetricsJson)
+                    .hrvMetrics(hrvMetricsJson)
+                    .voiceMetrics(voiceMetricsJson)
+                    .riskSummary(riskSummaryJson)
+                    .flaggedExcerpts(flaggedExcerptsJsonToSave)
+                    .actionableHighlights(actionItemsJsonToSave)
+                    .detectedLanguage(detectedLang)
+                    .translatedTranscript(translated)
+                    .versions("[{\"version\":1, \"transcript\":\"" + data.getTranscript().replace("\"","'") + "\", \"createdAt\":\"" + LocalDateTime.now().toString() + "\"}]")
+                    .audioUrl(null) // stub, or supply if available
+                    .aiReply(aiReply) // you can keep the AI reply here if you have it
+                    .createdAt(OffsetDateTime.now(ZoneOffset.UTC))
+                    .build();
+
+            sessionRepository.save(session);
+
+            Map<String,Object> response = new HashMap<>();
+            response.put("reply", aiReply);
+            response.put("faceMetrics", faceMetrics);
+            response.put("hrvMetrics", hrvMetrics);
+            response.put("voiceMetrics", voiceMetrics);
+            response.put("riskSummary", riskSummary);
+            response.put("flaggedExcerpts", flaggedExcerptsJsonToSave);
+            response.put("actionableHighlights", actionItemsJsonToSave);
+            response.put("detectedLanguage", detectedLang);
+            response.put("translatedTranscript", translated);
+            response.put("sessionId", session.getId());
+            response.put("privacyNote", "Demo only — metrics persisted, no raw media retained.");
+            return ResponseEntity.ok(response);
         } else {
-            // Handle the case where the API returns no candidates, possibly due to a safety filter
             System.out.println("AI response did not contain any candidates. Check safety settings or prompt.");
             return ResponseEntity.status(400).body(Map.of("error", "AI response was blocked or malformed."));
         }
@@ -146,14 +201,12 @@ public class VlogController {
         StringBuilder sb = new StringBuilder();
         sb.append("You are an empathetic coach. Here are the session metrics:\n\n");
 
-        // --- Face ---
         sb.append("Facial Expressions:\n");
         sb.append(" • Percent time: ").append(face.get("percentTime")).append("\n");
         sb.append(" • Avg confidence: ").append(face.get("avgConfidence")).append("\n");
         sb.append(" • Avg EAR: ").append(String.format("%.3f", faceAdv.get("avgEar"))).append("\n");
         sb.append(" • Blink rate: ").append(String.format("%.2f blinks/sec", faceAdv.get("avgBlinkRate"))).append("\n\n");
 
-        // --- HRV ---
         sb.append("Heart Rate Variability (time-domain):\n");
         sb.append(" • SDNN = ").append(String.format("%.1f ms", hrvTime.get("SDNN"))).append("\n");
         sb.append(" • RMSSD= ").append(String.format("%.1f ms", hrvTime.get("RMSSD"))).append("\n");
@@ -164,7 +217,6 @@ public class VlogController {
         sb.append(" • HF power = ").append(String.format("%.1f", hrvFreq.get("HF"))).append("\n");
         sb.append(" • LF/HF ratio = ").append(String.format("%.2f", hrvFreq.get("LF/HF"))).append("\n\n");
 
-        // --- Voice ---
         sb.append("Voice Summary (time-domain):\n");
         sb.append(" • Avg volume = ").append(String.format("%.3f", voiceTime.get("avgVolume"))).append("\n");
         sb.append(" • Max volume = ").append(String.format("%.3f", voiceTime.get("maxVolume"))).append("\n");
@@ -179,9 +231,38 @@ public class VlogController {
         sb.append(" • Avg ZCR = ")
                 .append(String.format("%.3f", voiceAdv.get("avgZcr"))).append("\n\n");
 
-        // --- Transcript & instructions ---
         sb.append("Transcript: \"").append(transcript).append("\"\n\n");
-        sb.append("Please offer 3–5 observations about their emotional state based on these metrics, and one actionable tip.\n");
+
+        sb.append("TASK (strict, follow order & headers exactly):\n\n");
+
+        sb.append("1) OBSERVATIONS — Transcript:\n");
+        sb.append(" • Write 2–3 empathetic reflections that connect transcript phrases to underlying feelings or needs (not just restating). Go deeper into emotional meaning, context, or possible struggles. One or two sentences each.\n\n");
+
+        sb.append("2) OBSERVATIONS — HRV (time-domain):\n");
+        sb.append(" • Interpret the SDNN, RMSSD, and pNN50 values with compassion. Instead of only labeling them 'low' or 'high', explain what that might feel like for the person (e.g., tension, difficulty unwinding) and why it matters for their emotional wellbeing. 1–2 sentences per metric.\n\n");
+
+        sb.append("3) OBSERVATIONS — HRV (frequency-domain):\n");
+        sb.append(" • Explain what the LF, HF, and LF/HF ratio suggest about balance between stress and recovery systems. Use empathetic, plain language (e.g., 'Your body seems to be working harder to stay alert, which can feel exhausting.').\n\n");
+
+        sb.append("4) OBSERVATIONS — Facial expressions:\n");
+        sb.append(" • Go beyond percentages — describe what the dominant facial state could reflect emotionally (e.g., 'a neutral expression most of the time may signal holding emotions in'). Keep it gentle and interpretive.\n\n");
+
+        sb.append("5) OBSERVATIONS — Voice:\n");
+        sb.append(" • Use the volume, pitch, and spectral features to give empathetic interpretations. For example, 'a very quiet voice can sometimes mean someone is feeling drained or tentative.' Provide 1–2 supportive interpretations.\n\n");
+
+        sb.append("6) FLAGGED_EXCERPTS:\n");
+        sb.append(" • Quote exact concerning transcript lines. Avoid paraphrasing. If none exist, write '- NONE'.\n\n");
+
+        sb.append("7) ACTIONABLE_HIGHLIGHTS:\n");
+        sb.append(" • Suggest 1–3 practical, supportive steps tied to the observations. Each should explain briefly *why* it’s helpful, so it feels encouraging rather than generic. (e.g., 'Try gentle breathing… this can help rebalance your nervous system when variability is low.').\n\n");
+
+        sb.append("FORMAT RULES:\n");
+        sb.append(" • Use the exact header names above.\n");
+        sb.append(" • Lists must be numbered (1., 2.) or bulleted with '-'.\n");
+        sb.append(" • Do NOT output JSON. Do NOT add extra commentary before headers.\n");
+        sb.append(" • End with: STRUCTURED_SECTION_END\n\n");
+
+        sb.append("TONE: Warm, empathetic, coaching. Always explain what the data *means for the person*, not just restating numbers.\n");
 
         return sb.toString();
     }

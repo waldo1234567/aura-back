@@ -12,4 +12,7 @@ public class SessionData {
 
     @NotNull
     private List<TimelineEntry> timeline;
+
+    @NotNull
+    private Boolean usePolished;
 }

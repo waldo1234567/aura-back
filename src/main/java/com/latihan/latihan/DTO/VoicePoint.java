@@ -12,4 +12,5 @@ public class VoicePoint {
     private List<Double> mfcc;
     private double spectralCentroid;
     private double zcr;
+    private boolean isValid;
 }

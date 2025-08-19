@@ -10,6 +10,7 @@ public class LatihanApplication {
 	public static void main(String[] args) {
 		Dotenv dotenv =Dotenv.configure().directory("src/main/resources").ignoreIfMissing().load();
 		System.setProperty("GOOGLE_API_KEY", System.getenv("GOOGLE_API_KEY") != null ? System.getenv("GOOGLE_API_KEY") : dotenv.get("GOOGLE_API_KEY"));
+		System.setProperty("DB_PASSWORD", System.getenv("DB_PASSWORD") != null ? System.getenv("DB_PASSWORD") : dotenv.get("DB_PASSWORD"));
 		SpringApplication.run(LatihanApplication.class, args);
 	}
 
