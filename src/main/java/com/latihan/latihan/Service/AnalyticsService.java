@@ -17,7 +17,6 @@ import java.util.stream.Collectors;
 
 @Service
 public class AnalyticsService {
-    private final ObjectMapper objectMapper = new ObjectMapper();
 
     public Map<String,Object> summarizeFace(List<ExpressionPoint> frames){
         Map<String, Object> out = new HashMap<>();
@@ -160,55 +159,86 @@ public class AnalyticsService {
             return Map.of("LF", 0.0, "HF", 0.0, "LF/HF", 0.0);
         }
 
-        int N0 = readings.size();
-        List<Double> times = new ArrayList<>();
-        List<Double> rrSec = new ArrayList<>();
-
-        long t0 = readings.get(0).getTime(); // ms
+        Map<Long, Double> lastPerTs = new LinkedHashMap<>();
         for (HrPoint r : readings) {
             Double bpm = r.getBpm();
             if (bpm == null || bpm <= 0) continue;
-            double t = (r.getTime() - t0) / 1000.0;
-            double rr = 60.0 / bpm;
-            if (Double.isFinite(t) && Double.isFinite(rr) && rr > 0) {
-                times.add(t);
-                rrSec.add(rr);
+            long rawT = r.getTime();
+            long tMs = (rawT > 1_000_000_000_000L) ? rawT : (long) (rawT * 1000.0); // support seconds or ms
+            lastPerTs.put(tMs, bpm); // keeps last for same timestamp
+        }
+
+        if (lastPerTs.size() < 4) {
+            return Map.of("LF", 0.0, "HF", 0.0, "LF/HF", 0.0, "valid", 0.0);
+        }
+
+        // --- 2) build filtered lists: remove duplicate/non-positive dt and huge gaps (>2000 ms)
+        List<Long> timesMsAll = new ArrayList<>(lastPerTs.keySet());
+        List<Double> bpmsAll   = new ArrayList<>(lastPerTs.values());
+
+        List<Long> timesMs = new ArrayList<>();
+        List<Double> rrSec  = new ArrayList<>(); // seconds
+
+        long prevT = -1;
+        for (int i = 0; i < timesMsAll.size(); i++) {
+            long t = timesMsAll.get(i);
+            double bpm = bpmsAll.get(i);
+            if (prevT == -1) {
+                // always accept first
+                timesMs.add(t);
+                rrSec.add(60.0 / bpm);
+                prevT = t;
+            } else {
+                long dt = t - prevT;
+                if (dt <= 0 || dt > 2000) {
+                    continue;
+                } else {
+                    timesMs.add(t);
+                    rrSec.add(60.0 / bpm);
+                    prevT = t;
+                }
             }
         }
 
-
-        // remove invalid entries
-        if (times.size() < 4) {
+        if (timesMs.size() < 4) {
             return Map.of("LF", 0.0, "HF", 0.0, "LF/HF", 0.0, "valid", 0.0);
         }
 
-        double duration = times.get(times.size() - 1) - times.get(0);
-        if (duration < 60.0) { // too short to reliably estimate spectral HRV; require at least 60s (conservative)
+        // convert times to seconds relative to start
+        double t0s = timesMs.get(0) / 1000.0;
+        List<Double> timesSec = new ArrayList<>(timesMs.size());
+        for (Long tm : timesMs) timesSec.add((tm / 1000.0) - t0s);
+
+        double duration = timesSec.get(timesSec.size() - 1) - timesSec.get(0);
+        if (duration < 60.0) { // require at least 60s for freq-HRV
             return Map.of("LF", 0.0, "HF", 0.0, "LF/HF", 0.0, "valid", 0.0);
         }
 
+        // --- 3) resample onto uniform grid at fs (Hz)
         double fs = 4.0; // 4 Hz
         int N = (int)Math.round(Math.max(256, Math.floor(fs * duration)));
         double dt = 1.0 / fs;
-        double startT = times.get(0);
+        double startT = timesSec.get(0);
         double[] resampled = new double[N];
+        double[] timesArr = timesSec.stream().mapToDouble(d -> d).toArray();
+        double[] rrArr = rrSec.stream().mapToDouble(d -> d).toArray();
+
         for (int i = 0; i < N; i++) {
             double tt = startT + i * dt;
-            // find interval
-            int idx = Arrays.binarySearch(times.stream().mapToDouble(d -> d).toArray(), tt);
+            int idx = Arrays.binarySearch(timesArr, tt);
             if (idx >= 0) {
-                resampled[i] = rrSec.get(idx);
+                resampled[i] = rrArr[idx];
             } else {
                 int ins = -idx - 1;
                 if (ins == 0) {
-                    resampled[i] = rrSec.get(0);
-                } else if (ins >= times.size()) {
-                    resampled[i] = rrSec.get(rrSec.size() - 1);
+                    resampled[i] = rrArr[0];
+                } else if (ins >= timesArr.length) {
+                    resampled[i] = rrArr[rrArr.length - 1];
                 } else {
                     int lo = ins - 1;
                     int hi = ins;
-                    double frac = (tt - times.get(lo)) / (times.get(hi) - times.get(lo));
-                    resampled[i] = rrSec.get(lo) * (1 - frac) + rrSec.get(hi) * frac;
+                    double frac = (tt - timesArr[lo]) / (timesArr[hi] - timesArr[lo]);
+                    resampled[i] = rrArr[lo] * (1 - frac) + rrArr[hi] * frac;
                 }
             }
         }
@@ -240,88 +270,59 @@ public class AnalyticsService {
         return Map.of("LF", lf, "HF", hf, "LF/HF", ratio, "valid", 1.0);
     }
 
-    private double[] padToPowerOfTwo(double[] data){
-        int n = data.length;
-        int target = 1;
-        while(target < n){
-            target <<= 1;
-        }
-        if(target == n ) return data;
-        double[] padded = Arrays.copyOf(data, target);
-        return padded;
-    }
 
     public void diagnoseAndComputeHrMetrics(List<HrPoint> readings) {
         if (readings == null || readings.isEmpty()) {
             System.out.println("no hr readings");
             return;
         }
-        // Build arrays, guess time units: treat getTime()>1e12 as ms, otherwise seconds -> convert to ms
-        List<Long> timesMs = new ArrayList<>();
-        List<Double> rrMsRaw = new ArrayList<>();
+
+        Map<Long, Double> lastPerTs = new LinkedHashMap<>();
         for (HrPoint h : readings) {
             Double bpm = h.getBpm();
-            if (bpm == null || bpm <= 0) continue;
-            long tRaw = h.getTime();
-            long tMs = tRaw > 1_000_000_000_000L ? tRaw : (long)(tRaw * 1000.0);
-            timesMs.add(tMs);
-            rrMsRaw.add(60.0 / bpm * 1000.0); // RR in ms
+            if (bpm == null || h.getBpm() <= 0) continue;
+            long tMs = h.getTime() > 1_000_000_000_000L ? h.getTime() : (long)(h.getTime() * 1000.0);
+            lastPerTs.put(tMs, h.getBpm());
         }
+        List<Long> timesMs = new ArrayList<>(lastPerTs.keySet());
+        List<Double> rrMsRaw = lastPerTs.values().stream()
+                .map(b -> 60.0 / b * 1000.0) // <-- CORRECT: 60/bpm -> seconds, *1000 -> ms
+                .collect(Collectors.toList());
 
-        if (timesMs.size() < 2) {
-            System.out.println("not enough valid bpm samples");
-            return;
-        }
-
-        // Compute raw dt stats (ms)
-        List<Long> dts = new ArrayList<>();
-        for (int i = 0; i < timesMs.size() - 1; i++) {
-            dts.add(timesMs.get(i + 1) - timesMs.get(i));
-        }
-        double meanDt = dts.stream().mapToLong(Long::longValue).average().orElse(Double.NaN);
-        long minDt = dts.stream().mapToLong(Long::longValue).min().orElse(-1);
-        long maxDt = dts.stream().mapToLong(Long::longValue).max().orElse(-1);
-        System.out.printf("raw sample dt (ms): mean=%.1f min=%d max=%d count=%d%n", meanDt, minDt, maxDt, dts.size());
-
-        // Filter out dt <= 0 and huge gaps > 2000ms
+// Filter bad dt and build rrMsFiltered
         List<Double> rrMsFiltered = new ArrayList<>();
-        List<Long> timesFiltered = new ArrayList<>();
-        timesFiltered.add(timesMs.get(0));
-        rrMsFiltered.add(rrMsRaw.get(0));
-        for (int i = 1; i < timesMs.size(); i++) {
-            long dt = timesMs.get(i) - timesMs.get(i - 1);
-            if (dt <= 0 || dt > 2000) {
-                // skip this sample (duplicate or big gap)
-                continue;
+        List<Long> tFilt = new ArrayList<>();
+        if (!timesMs.isEmpty()) {
+            tFilt.add(timesMs.get(0));
+            rrMsFiltered.add(rrMsRaw.get(0));
+            for (int i = 1; i < timesMs.size(); i++) {
+                long dt = timesMs.get(i) - timesMs.get(i-1);
+                if (dt <= 0 || dt > 2000) continue; // skip duplicates or huge gaps
+                tFilt.add(timesMs.get(i));
+                rrMsFiltered.add(rrMsRaw.get(i));
             }
-            timesFiltered.add(timesMs.get(i));
-            rrMsFiltered.add(rrMsRaw.get(i));
         }
 
-        System.out.println("after filtering: samples = " + rrMsFiltered.size());
-        if (rrMsFiltered.size() < 2) {
-            System.out.println("too few filtered samples for RMSSD/SDNN");
-            return;
+        if (rrMsFiltered.size() >= 2) {
+            int M = rrMsFiltered.size();
+            double mean = rrMsFiltered.stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
+            double sdnn = Math.sqrt(rrMsFiltered.stream().mapToDouble(x -> Math.pow(x - mean, 2)).sum() / (M - 1));
+
+            double sumDiffSq = 0;
+            int cnt50 = 0;
+            for (int i = 0; i < M - 1; i++) {
+                double diff = rrMsFiltered.get(i + 1) - rrMsFiltered.get(i);
+                sumDiffSq += diff * diff;
+                if (Math.abs(diff) > 50) cnt50++;
+            }
+            double rmssd = Math.sqrt(sumDiffSq / (double)(M - 1));
+            double pnn50 = (M > 1) ? cnt50 / (double)(M - 1) * 100.0 : 0.0;
+
+            System.out.printf("Filtered SDNN(ms)=%.3f RMSSD(ms)=%.3f pNN50=%.2f%%%n", sdnn, rmssd, pnn50);
+            System.out.printf("RR mean(ms)=%.3f RR std(ms)=%.3f count=%d%n", mean, Math.sqrt(rrMsFiltered.stream().mapToDouble(x -> Math.pow(x-mean,2)).sum()/(M-1)), M);
+        } else {
+            System.out.println("Too few filtered RR samples after dedupe/filter.");
         }
-
-        // SDNN
-        double mean = rrMsFiltered.stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
-        double sumSq = rrMsFiltered.stream().mapToDouble(r -> Math.pow(r - mean, 2)).sum();
-        double sdnn = Math.sqrt(sumSq / (rrMsFiltered.size() - 1));
-
-        // RMSSD & pNN50
-        double sumDiffSq = 0;
-        int cnt50 = 0;
-        for (int i = 0; i < rrMsFiltered.size() - 1; i++) {
-            double diff = rrMsFiltered.get(i + 1) - rrMsFiltered.get(i);
-            sumDiffSq += diff * diff;
-            if (Math.abs(diff) > 50) cnt50++;
-        }
-        double rmssd = Math.sqrt(sumDiffSq / Math.max(1, rrMsFiltered.size() - 1));
-        double pnn50 = (rrMsFiltered.size() > 1) ? (cnt50 / (double)(rrMsFiltered.size() - 1) * 100.0) : 0.0;
-
-        System.out.printf("Filtered SDNN(ms)=%.3f RMSSD(ms)=%.3f pNN50=%.2f%%%n", sdnn, rmssd, pnn50);
-        System.out.printf("RR mean(ms)=%.3f RR std(ms)=%.3f%n", mean, Math.sqrt(sumSq / (rrMsFiltered.size() - 1)));
     }
     public Map<String,Object> computeRiskSummary(Map<String,Object> faceMetrics,
                                                  Map<String, Double> hrvMetrics,
