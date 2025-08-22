@@ -3,6 +3,7 @@ package com.latihan.latihan.Service;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.latihan.latihan.DTO.ExpressionPoint;
 import com.latihan.latihan.DTO.HrPoint;
+import com.latihan.latihan.DTO.TimelineEntry;
 import com.latihan.latihan.DTO.VoicePoint;
 import org.apache.commons.math3.complex.Complex;
 import org.apache.commons.math3.transform.DftNormalization;
@@ -11,6 +12,8 @@ import org.apache.commons.math3.transform.TransformType;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
+import java.util.function.BiFunction;
+import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -374,6 +377,236 @@ public class AnalyticsService {
         out.put("explanation", explanation);
         System.out.println(out + "==> risk summary output");
         return out;
+    }
+
+    public Map<String,Object> computeDiagnosticsFromTimeline(List<TimelineEntry> timeline, String transcript) {
+        Map<String,Object> out = new HashMap<>();
+        if (timeline == null || timeline.isEmpty()) {
+            out.put("beatsUsed", 0);
+            out.put("duration_s", 0.0);
+            out.put("audioValidFraction", 0.0);
+            out.put("faceConfidence", 0.0);
+            out.put("transcriptWords", transcript == null ? 0 : transcript.split("\\s+").length);
+            out.put("meanBpm", 0.0);
+            out.put("voiceActivityFrac", 0.0);
+            out.put("longPauseFrac", 0.0);
+            out.put("pitchVar", 0.0);
+            out.put("maxPitch", 0.0);
+            return out;
+        }
+
+        // duration
+        List<Long> times = timeline.stream()
+                .map(TimelineEntry::getTime)
+                .filter(Objects::nonNull)
+                .sorted()
+                .collect(Collectors.toList());
+        double duration_s = (times.get(times.size()-1) - times.get(0)) / 1000.0;
+
+        // HR dedupe (keep last per timestamp)
+        Map<Long, Double> lastPerTs = new LinkedHashMap<>();
+        for (TimelineEntry e : timeline) {
+            HrPoint hr = e.getHr();
+            Double bpm = e.getHr().getBpm();
+            if (hr != null && bpm != null && hr.getBpm() > 0) {
+                lastPerTs.put(hr.getTime(), hr.getBpm());
+            }
+        }
+        List<Double> bpms = new ArrayList<>(lastPerTs.values());
+        int beatsUsed = bpms.size();
+        double meanBpm = beatsUsed > 0 ? bpms.stream().mapToDouble(Double::doubleValue).average().orElse(0.0) : 0.0;
+
+        // Voice aggregates
+        List<VoicePoint> voices = timeline.stream()
+                .map(TimelineEntry::getVoice)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toList());
+        long validCount = voices.stream()
+                .filter(v -> Boolean.TRUE.equals(v.isValid()) || Boolean.TRUE.equals(v.isValid()))
+                .count();
+        double audioValidFraction = voices.isEmpty() ? 0.0 : (validCount / (double) voices.size());
+        double voiceActivityFrac = timeline.size() > 0 ? (voices.size() / (double) timeline.size()) : 0.0;
+
+        // pitch stats
+        List<Double> pitches = voices.stream()
+                .map(VoicePoint::getPitch)
+                .filter(Objects::nonNull)
+                .filter(p -> p > 0)
+                .collect(Collectors.toList());
+        double maxPitch = pitches.isEmpty() ? 0.0 : pitches.stream().mapToDouble(Double::doubleValue).max().orElse(0.0);
+        double pitchVar = 0.0;
+        if (pitches.size() > 1) {
+            double meanP = pitches.stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
+            pitchVar = pitches.stream().mapToDouble(p -> Math.pow(p - meanP, 2)).sum() / (pitches.size() - 1);
+        }
+
+        // longPauseFrac (voice time gaps > 2000 ms)
+        List<Long> vTimes = voices.stream().map(VoicePoint::getTime).filter(Objects::nonNull).sorted().collect(Collectors.toList());
+        int longGaps = 0;
+        for (int i = 1; i < vTimes.size(); i++) if (vTimes.get(i) - vTimes.get(i-1) > 2000) longGaps++;
+        double longPauseFrac = vTimes.size() > 1 ? (longGaps / (double)(vTimes.size() - 1)) : 0.0;
+
+        // face confidence
+        List<Double> faceConfs = timeline.stream()
+                .map(TimelineEntry::getExpression)
+                .filter(Objects::nonNull)
+                .map(ExpressionPoint::getConfidence)
+                .filter(Objects::nonNull)
+                .mapToDouble(Double::doubleValue).boxed().collect(Collectors.toList());
+        double faceConfidence = faceConfs.isEmpty() ? 0.0 : faceConfs.stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
+
+        int transcriptWords = transcript == null ? 0 : transcript.trim().isEmpty() ? 0 : transcript.trim().split("\\s+").length;
+
+        out.put("beatsUsed", beatsUsed);
+        out.put("duration_s", duration_s);
+        out.put("audioValidFraction", audioValidFraction);
+        out.put("faceConfidence", faceConfidence);
+        out.put("transcriptWords", transcriptWords);
+        out.put("meanBpm", meanBpm);
+        out.put("voiceActivityFrac", voiceActivityFrac);
+        out.put("longPauseFrac", longPauseFrac);
+        out.put("pitchVar", pitchVar);
+        out.put("maxPitch", maxPitch);
+
+        return out;
+    }
+
+    @SuppressWarnings("unchecked")
+    public Map<String,Object> computeSpiderScores(
+            Map<String,Object> face,
+            Map<String,Double> hrvTime,
+            Map<String,Double> hrvFreq,
+            Map<String,Double> voiceTime,
+            Map<String,Object> voiceAdv,
+            Map<String,Object> diagnostics
+    ) {
+        // safe getters
+        double lf_hf = getDoubleSafe(hrvFreq != null ? hrvFreq.get("LF/HF") : null);
+        double rmssd = getDoubleSafe(hrvTime != null ? hrvTime.get("RMSSD") : null);
+        double sdnn  = getDoubleSafe(hrvTime != null ? hrvTime.get("SDNN") : null);
+        double meanBpm = getDoubleSafe(diagnostics != null ? diagnostics.get("meanBpm") : null);
+        double avgPitch = getDoubleSafe(voiceTime != null ? voiceTime.get("avgPitch") : null);
+        double avgVol = getDoubleSafe(voiceTime != null ? voiceTime.get("avgVolume") : null);
+
+        Map<String, Double> percentTime = new HashMap<>();
+        if (face != null && face.get("percentTime") instanceof Map) {
+            try {
+                Map<?,?> pt = (Map<?,?>) face.get("percentTime");
+                pt.forEach((k,v) -> percentTime.put(String.valueOf(k), getDoubleSafe(v)));
+            } catch (ClassCastException ignored) { /* fallback to empty */ }
+        }
+        double sadPct = percentTime.getOrDefault("sad", 0.0);
+        double angryPct = percentTime.getOrDefault("angry", 0.0);
+        double happyPct = percentTime.getOrDefault("happy", 0.0);
+
+        // diagnostics
+        double beatsUsed = getDoubleSafe(diagnostics != null ? diagnostics.get("beatsUsed") : null);
+        double audioValidFraction = getDoubleSafe(diagnostics != null ? diagnostics.get("audioValidFraction") : null);
+        double faceConf = getDoubleSafe(diagnostics != null ? diagnostics.get("faceConfidence") : null);
+        double transcriptWords = getDoubleSafe(diagnostics != null ? diagnostics.get("transcriptWords") : null);
+
+        // normalized helpers (0..1)
+        java.util.function.DoubleUnaryOperator norm = (v) -> 0.0; // placeholder not used
+        // use explicit method below: normVal(value, min, max)
+
+        // confidence (0..1)
+        double confRaw = 0.4 * Math.min(1.0, beatsUsed / 120.0)
+                + 0.3 * clamp01(audioValidFraction)
+                + 0.2 * clamp01(faceConf)
+                + 0.1 * Math.min(1.0, transcriptWords / 30.0);
+        double conf = clamp01(confRaw);
+
+        // Axis formulas (0..1)
+        double stressScore = clamp01(
+                0.4 * normVal(lf_hf, 0.0, 20.0)
+                        + 0.3 * (1.0 - normVal(rmssd, 0.0, 50.0))
+                        + 0.2 * normVal(meanBpm, 40.0, 150.0)
+                        + 0.1 * clamp01(angryPct)
+        );
+
+        double lowMoodScore = clamp01(
+                0.35 * clamp01(sadPct)
+                        + 0.25 * (1.0 - normVal(avgPitch, 50.0, 300.0))
+                        + 0.20 * (1.0 - normVal(avgVol, 0.0, 0.5))
+                        + 0.20 * (1.0 - normVal(sdnn, 0.0, 60.0))
+        );
+
+        double voiceActivityFrac = getDoubleSafe(diagnostics != null ? diagnostics.getOrDefault("voiceActivityFrac", 0.0) : 0.0);
+        double socialScore = clamp01(
+                0.4 * (1.0 - clamp01(voiceActivityFrac))
+                        + 0.3 * (1.0 - normVal(avgVol, 0.0, 0.5))
+                        + 0.3 * (1.0 - clamp01(happyPct))
+        );
+
+        double maxPitch = getDoubleSafe(diagnostics != null ? diagnostics.getOrDefault("maxPitch", 0.0) : 0.0);
+        double irritability = clamp01(
+                0.5 * clamp01(angryPct)
+                        + 0.3 * normVal(maxPitch, 50.0, 300.0)
+                        + 0.2 * normVal(lf_hf, 0.0, 20.0)
+        );
+
+        double longPauseFrac = getDoubleSafe(diagnostics != null ? diagnostics.getOrDefault("longPauseFrac", 0.0) : 0.0);
+        double avgZcr = getDoubleSafe(voiceAdv != null ? voiceAdv.getOrDefault("avgZcr", 0.0) : null);
+        double pitchVar = getDoubleSafe(diagnostics != null ? diagnostics.getOrDefault("pitchVar", 0.0) : 0.0);
+
+        double cognitiveFatigue = clamp01(
+                0.4 * clamp01(longPauseFrac)
+                        + 0.3 * (1.0 - clamp01(avgZcr / 2000.0))
+                        + 0.3 * (1.0 - normVal(pitchVar, 0.0, 100.0))
+        );
+
+        double spectralCentroid = getDoubleSafe(voiceAdv != null ? voiceAdv.getOrDefault("avgSpectralCentroid", 0.0) : 0.0);
+        double arousal = clamp01(
+                0.5 * normVal(meanBpm, 40.0, 150.0)
+                        + 0.3 * normVal(lf_hf, 0.0, 20.0)
+                        + 0.2 * clamp01(spectralCentroid / 5000.0)
+        );
+
+        // scale to 0..100 and apply confidence weighting (conf 0..1)
+        Map<String,Object> out = new LinkedHashMap<>();
+        out.put("Stress", (int) Math.round(stressScore * 100.0 * conf));
+        out.put("LowMood", (int) Math.round(lowMoodScore * 100.0 * conf));
+        out.put("SocialWithdrawal", (int) Math.round(socialScore * 100.0 * conf));
+        out.put("Irritability", (int) Math.round(irritability * 100.0 * conf));
+        out.put("CognitiveFatigue", (int) Math.round(cognitiveFatigue * 100.0 * conf));
+        out.put("Arousal", (int) Math.round(arousal * 100.0 * conf));
+        out.put("confidence", (int) Math.round(conf * 100.0));
+
+        return out;
+    }
+
+    // helper: clamp to 0..1 safely
+    private static double clamp01(double v) {
+        if (Double.isFinite(v)) {
+            return Math.max(0.0, Math.min(1.0, v));
+        } else {
+            return 0.0;
+        }
+    }
+
+    // helper: normalize value to [0,1] given min/max (handles NaN/null)
+    private static double normVal(double v, double min, double max) {
+        if (!Double.isFinite(v)) return 0.0;
+        if (max <= min) return 0.0;
+        double t = (v - min) / (max - min);
+        return Math.max(0.0, Math.min(1.0, t));
+    }
+
+    // safe number extraction (handles Number types, Strings, null)
+    private static double getDoubleSafe(Object o) {
+        if (o == null) return 0.0;
+        if (o instanceof Number) {
+            double d = ((Number) o).doubleValue();
+            if (Double.isFinite(d)) return d;
+            return 0.0;
+        }
+        try {
+            String s = String.valueOf(o);
+            if (s.isEmpty()) return 0.0;
+            double d = Double.parseDouble(s);
+            if (Double.isFinite(d)) return d;
+        } catch (Exception ignored) {}
+        return 0.0;
     }
 
     public Map<String,Object> parseAiReplyForStructuredData(String aiReply, ObjectMapper mapper) {

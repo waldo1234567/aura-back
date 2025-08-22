@@ -77,6 +77,10 @@ public class SessionEntity {
     @Column(name = "ai_reply", columnDefinition = "TEXT")
     private String aiReply;
 
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(name = "spider_metrics", columnDefinition = "JSONB")
+    private String spiderData;
+
     @Column(name = "created_at", columnDefinition = "TIMESTAMP WITH TIME ZONE")
     private OffsetDateTime createdAt;
 }

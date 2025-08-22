@@ -6,6 +6,7 @@ import com.latihan.latihan.DTO.*;
 import com.latihan.latihan.Entity.SessionEntity;
 import com.latihan.latihan.Repository.SessionRepository;
 import com.latihan.latihan.Service.AnalyticsService;
+import com.latihan.latihan.Service.SpiderDataValidator;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -58,6 +59,16 @@ public class VlogController {
         Map<String, Double> hrvFreq = analyticsService.computeFrequencyHrv(heartRates);
         analyticsService.diagnoseAndComputeHrMetrics(heartRates);
         Map<String,Object> riskSummary = analyticsService.computeRiskSummary(faceMetrics, hrvMetrics, voiceMetrics, data.getTranscript());
+        Map<String,Object> diagnostics = analyticsService.computeDiagnosticsFromTimeline(data.getTimeline(), data.getTranscript());
+
+        Map<String,Object> metrics = new HashMap<>();
+        metrics.put("face", faceMetrics);
+        metrics.put("hrvTime", hrvMetrics);
+        metrics.put("hrvFreq", hrvFreq);
+        metrics.put("voiceTime", voiceMetrics);
+        metrics.put("voiceAdv", voiceAdv);
+        metrics.put("diagnostics", diagnostics);
+
         System.out.print("tes");
         List<String> dangerKeywords = List.of("suicide","kill myself","i can't go on","don't want to live","hopeless","end my life","suicidal");
 
@@ -129,7 +140,7 @@ public class VlogController {
                 }
             }
             System.out.println(aiReply);
-
+            Map<String,Object> parsedSpider = SpiderDataValidator.parseAndValidateSpiderData(aiReply, metrics, analyticsService);
             Map<String,Object> parsed = analyticsService.parseAiReplyForStructuredData(aiReply, mapper);
 
             @SuppressWarnings("unchecked")
@@ -142,6 +153,8 @@ public class VlogController {
 
             String flaggedExcerptsJsonToSave = mapper.writeValueAsString(parsedFlagged);
             String actionItemsJsonToSave   = mapper.writeValueAsString(parsedActions);
+
+            String spiderJson = mapper.writeValueAsString(parsedSpider);
 
             SessionEntity session = SessionEntity.builder()
                     .transcript(data.getTranscript())
@@ -156,7 +169,8 @@ public class VlogController {
                     .detectedLanguage(detectedLang)
                     .translatedTranscript(translated)
                     .versions("[{\"version\":1, \"transcript\":\"" + data.getTranscript().replace("\"","'") + "\", \"createdAt\":\"" + LocalDateTime.now().toString() + "\"}]")
-                    .audioUrl(null) // stub, or supply if available
+                    .audioUrl(null)
+                    .spiderData(spiderJson)// stub, or supply if available
                     .aiReply(aiReply) // you can keep the AI reply here if you have it
                     .createdAt(OffsetDateTime.now(ZoneOffset.UTC))
                     .build();
@@ -174,6 +188,7 @@ public class VlogController {
             response.put("detectedLanguage", detectedLang);
             response.put("translatedTranscript", translated);
             response.put("sessionId", session.getId());
+            response.put("spiderJson", session.getSpiderData());
             response.put("privacyNote", "Demo only — metrics persisted, no raw media retained.");
             return ResponseEntity.ok(response);
         } else {
@@ -263,6 +278,12 @@ public class VlogController {
         sb.append(" • End with: STRUCTURED_SECTION_END\n\n");
 
         sb.append("TONE: Warm, empathetic, coaching. Always explain what the data *means for the person*, not just restating numbers.\n");
+
+        sb.append("\nADDITIONAL_OUTPUT (after STRUCTURED_SECTION_END):\n");
+        sb.append(" • After the text ends with STRUCTURED_SECTION_END, on the very next line output a single CSV-style line prefixed with 'SPIDER_DATA:' containing six integers (0-100) for the axes in this exact order: Stress, LowMood, SocialWithdrawal, Irritability, CognitiveFatigue, Arousal. Example: SPIDER_DATA:72,34,12,22,40,65\n");
+        sb.append(" • Immediately after those six integers append ',CONF:' and a single integer (0-100) representing overall confidence. Example: SPIDER_DATA:72,34,12,22,40,65,CONF:82\n");
+        sb.append(" • That single line must contain ONLY the prefix and numbers (no JSON, no extra words, no explanation). Do NOT change or repeat the structured sections above.\n");
+
 
         return sb.toString();
     }
