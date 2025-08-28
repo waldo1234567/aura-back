@@ -402,14 +402,20 @@ public class AnalyticsService {
                 .sorted()
                 .collect(Collectors.toList());
         double duration_s = (times.get(times.size()-1) - times.get(0)) / 1000.0;
-
+        if (!times.isEmpty()) {
+            duration_s = (times.get(times.size()-1) - times.get(0)) / 1000.0;
+            if (duration_s < 0) duration_s = 0.0;
+        }
         // HR dedupe (keep last per timestamp)
         Map<Long, Double> lastPerTs = new LinkedHashMap<>();
         for (TimelineEntry e : timeline) {
             HrPoint hr = e.getHr();
-            Double bpm = e.getHr().getBpm();
-            if (hr != null && bpm != null && hr.getBpm() > 0) {
-                lastPerTs.put(hr.getTime(), hr.getBpm());
+            if (hr == null) continue; // <-- safe guard
+            Long hrTime = hr.getTime();
+            Double bpm = hr.getBpm();
+            if (hrTime != null && bpm != null && bpm > 0) {
+                // store last reading for that timestamp (replaces previous with same ts)
+                lastPerTs.put(hrTime, bpm);
             }
         }
         List<Double> bpms = new ArrayList<>(lastPerTs.values());
