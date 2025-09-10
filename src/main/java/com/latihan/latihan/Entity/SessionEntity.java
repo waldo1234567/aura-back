@@ -23,9 +23,6 @@ public class SessionEntity {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private long id;
 
-    @Column(name = "user_id")
-    private long userId;
-
     @Column(columnDefinition = "TEXT")
     private String transcript;
 
